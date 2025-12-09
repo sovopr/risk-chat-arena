@@ -1,0 +1,5 @@
+streamlit
+openai
+google-genai
+PyMuPDF
+tqdm
