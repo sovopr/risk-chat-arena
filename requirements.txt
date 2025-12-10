@@ -3,3 +3,5 @@ openai
 google-genai
 PyMuPDF
 tqdm
+gspread
+oauth2client
