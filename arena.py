@@ -16,9 +16,9 @@ from google.genai import types
 st.set_page_config(page_title="Risk Chat Arena", layout="wide")
 
 # --- CONFIGURATION ---
-MODEL_GPT5 = "gpt-5-mini"          # Model A
+# Removed GPT-5 Mini
 MODEL_B = "gemini-3-pro-preview"   # Model B
-MODEL_GPT5_1 = "gpt-5.1"           # Model C
+MODEL_GPT5_1 = "gpt-5.2"           # Model C
 MAX_TURNS = 30                     # Max questions per session
 GOOGLE_SHEET_NAME = "RiskArenaLogs" # Name of your Google Sheet
 
@@ -27,8 +27,7 @@ CHATGPT5_API_KEY = st.secrets.get("OPENAI_API_KEY")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
 
 # --- COST ASSUMPTIONS (per 1M tokens) ---
-COST_GPT5_INPUT = 0.00
-COST_GPT5_OUTPUT = 0.00
+# Removed GPT-5 Mini Costs
 COST_B_INPUT = 0.00
 COST_B_OUTPUT = 0.00
 COST_GPT5_1_INPUT = 0.00
@@ -42,10 +41,7 @@ def init_state(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
 
-# Model Histories
-init_state("messages_gpt5", [])
-init_state("tokens_gpt5", {"input": 0, "output": 0})
-
+# Model Histories (Removed messages_gpt5)
 init_state("messages_b", [])
 init_state("tokens_b", {"input": 0, "output": 0})
 
@@ -83,7 +79,7 @@ def get_gspread_client():
         st.error(f"❌ Google Auth Error: {e}")
         return None
 
-def log_to_google_sheet(question, r_gpt5, r_gemini, r_gpt5_1):
+def log_to_google_sheet(question, r_gemini, r_gpt5_1):
     """
     Appends the interaction data to the Google Sheet.
     """
@@ -99,7 +95,8 @@ def log_to_google_sheet(question, r_gpt5, r_gemini, r_gpt5_1):
         try:
             val = sheet.acell('A1').value
             if not val:
-                headers = ["User ID", "Turn Number", "Timestamp", "Question", "GPT-5 Mini", "Gemini-3-Pro", "GPT-5.1"]
+                # Removed GPT-5 Mini Header
+                headers = ["User ID", "Turn Number", "Timestamp", "Question", "Gemini-3-Pro", "GPT-5.2"]
                 sheet.append_row(headers)
         except:
             pass
@@ -111,7 +108,6 @@ def log_to_google_sheet(question, r_gpt5, r_gemini, r_gpt5_1):
             st.session_state.turn_count,
             timestamp,
             question,
-            r_gpt5,
             r_gemini,
             r_gpt5_1
         ]
@@ -312,15 +308,31 @@ with st.sidebar:
     st.divider()
     st.header("🧠 2. The 'Teacher' Persona")
 
-    default_prompt = """You are a SEBI/AMFI registered investor-facing mutual fund advisor for an investor who lives in India. You need to explain in precise, factful, pleasant, conversational tone about the information provided in a mutual fund factsheet. 
+    default_prompt = """You are tasked with a role of a SEBI/AMFI registered mutual fund advisor for a novice investor who lives in India. You are about to be asked questions about a mutual fund factsheet from a novice Indian investor.
 
-I. Please help an investor understand all required information and financial concepts in a mutual fund factsheet so that the investor can decide suitability in line with SEBI’s disclosure.
+Your job is to communicate about the information provided in a mutual fund factsheet (you shall be provided with a factsheet), such that the investor feels confident, satisfied, develops trust with the advisor and makes informed investment decisions. Particularly, you shall respond to the investor’s questions using the following communication strategies.
 
-II. Please keep the responses as concise but without losing clarity. Generate simplified definitions of complex financial terms, tailored to reading by naive investors and supported by relevant examples. 
+**Strategy List”
+Clear, compliant communication for a novice investor should be simple, suitability-led, and disclosure-first—so the factsheet becomes easy to understand without overselling or promising returns.​
+1. Analogy-Based Simplification (De-jargonizing)
+I will replace complex financial terms with relatable everyday concepts to reduce intimidation. For example, I will explain the mutual fund structure using the "Pizza Analogy"—where you and other investors contribute to a whole pizza (the fund), and the chef (fund manager) selects the best ingredients (stocks/bonds) for everyone to share.​
+2. Goal-Based Contextualization (The "Why")
+Instead of focusing solely on the "Investment Objective" text, I will directly map the fund's time horizon and growth potential to your specific life goals, such as buying a home or retirement planning. This shifts the conversation from abstract percentages to tangible life outcomes, making the investment feel relevant and necessary for your future.​
+3. Tangible Portfolio Walkthrough (The "Brand" Connection)
+I will use the "Top Holdings" section of the factsheet to point out familiar company names (e.g., HDFC, Reliance, TCS) that you likely interact with daily. This strategy transforms the fund from a "paper asset" into a real-world ownership stake in businesses you already know and trust, instantly demystifying where your money is going.​
+4. Visual Risk Education (The "Weather" Metaphor)
+I will use the "Riskometer" on the factsheet to proactively discuss volatility, comparing market ups and downs to changing weather—unpredictable daily but seasonal in the long run. By normalizing risk as the "price of admission" for inflation-beating growth rather than hiding it, I build deep trust and manage your expectations for future market dips.​
+5. Comparative Benchmarking (The "Report Card")
+I will use the "Benchmark vs. Scheme Performance" section to show how the fund has performed relative to the general market, acting as a "report card" for the fund manager. This helps you understand if the professional fees you are paying are justified by the manager's ability to deliver results better than a standard index.​
+6. Cost-Benefit Reframing (Expense Ratio)
+I will explain the "Expense Ratio" not as a lost cost, but as a professional fee similar to paying a doctor or lawyer for expert care. I will clarify that the returns shown in the factsheet are Net of Expenses (after fees are deducted), ensuring you understand that the profit figures you see are what you actually keep.​
+7. Regulatory Safety Assurance (SEBI/AMFI Context)
+I will explicitly mention the "Fund House/AMC" details and their regulation by SEBI to assure you that your money is handled within a strict legal framework. Highlighting that your funds are held in a Trust and not the advisor's personal account eliminates fear of fraud and establishes institutional credibility.
 
-III. If any required detail in not present in the document, explicitly state “Not stated in the document”. Refrain from answering questions that are out of syllabus from the mutual fund factsheets.
-
-IV. Please cover all the concepts needed to understand mutual fund factsheets, even if the investor forgets to ask."""
+Operational rules for every response:
+· Stay within the mutual fund factsheet (and references inside it, e.g., SID/SAI/KIM if mentioned). Do not answer questions outside the scope of the mutual fund fachsheet. If asked, say: “Out of scope for factsheet-based discussion” Or “Not stated in the document.”
+· Keep answers clear and concise. Include a brief real-world example only when it improves understanding (no hype, no guarantees).
+· Proactively explain any concepts needed to understand the factsheet section being discussed, even if the investor doesn’t ask."""
 
     system_prompt = st.text_area("System Instructions", value=default_prompt, height=250)
 
@@ -330,11 +342,7 @@ IV. Please cover all the concepts needed to understand mutual fund factsheets, e
     def calc_cost(tokens, input_cost, output_cost):
         return ((tokens['input'] / 1e6) * input_cost) + ((tokens['output'] / 1e6) * output_cost)
 
-    # 1. GPT-5 Mini
-    cost_gpt5 = calc_cost(st.session_state.tokens_gpt5, COST_GPT5_INPUT, COST_GPT5_OUTPUT)
-    st.markdown(f"**🟢 {MODEL_GPT5}**")
-    st.markdown(f"💵 **${cost_gpt5:.4f}**")
-    st.markdown("---")
+    # 1. GPT-5 Mini (Removed)
 
     # 2. Gemini
     cost_b = calc_cost(st.session_state.tokens_b, COST_B_INPUT, COST_B_OUTPUT)
@@ -349,7 +357,6 @@ IV. Please cover all the concepts needed to understand mutual fund factsheets, e
 
     if st.button("Reset Conversation"):
         keys_to_reset = [
-            "messages_gpt5", "tokens_gpt5",
             "messages_b", "tokens_b",
             "messages_gpt5_1", "tokens_gpt5_1",
             "openai_file_cache", "turn_count"
@@ -365,38 +372,29 @@ IV. Please cover all the concepts needed to understand mutual fund factsheets, e
         st.rerun()
 
 # --- UI (UPDATED: ROW-BASED LAYOUT) ---
-st.title("🛡️ Conversational Risk Arena (Tri-Model Duel)")
+st.title("🛡️ Conversational Risk Arena (Dual-Model Duel)")
 
-# Iterate through history by turn (User -> 3 Assistants)
-# We use messages_gpt5 as the master list for length
-if "messages_gpt5" in st.session_state and len(st.session_state.messages_gpt5) > 0:
-    for i in range(0, len(st.session_state.messages_gpt5), 2):
+# Iterate through history by turn (User -> 2 Assistants)
+# We use messages_b as the master list for length
+if "messages_b" in st.session_state and len(st.session_state.messages_b) > 0:
+    for i in range(0, len(st.session_state.messages_b), 2):
         
         # 1. DISPLAY USER QUESTION (Full Width)
-        user_content = st.session_state.messages_gpt5[i]["content"]
+        user_content = st.session_state.messages_b[i]["content"]
         with st.chat_message("user"):
             st.markdown(user_content)
             
-        # 2. DISPLAY 3 MODEL ANSWERS (Columns below the question)
-        if i + 1 < len(st.session_state.messages_gpt5):
-            c1, c2, c3 = st.columns(3)
+        # 2. DISPLAY 2 MODEL ANSWERS (Columns below the question)
+        if i + 1 < len(st.session_state.messages_b):
+            c2, c3 = st.columns(2)
             
-            # Model A
-            with c1:
-                st.subheader(f"🟢 {MODEL_GPT5}")
-                msg_a = st.session_state.messages_gpt5[i+1]
-                with st.chat_message(msg_a["role"]):
-                    if "Error" in msg_a["content"]: st.error(msg_a["content"])
-                    else: st.markdown(msg_a["content"])
-
             # Model B
             with c2:
                 st.subheader(f"🔵 {MODEL_B}")
-                if i+1 < len(st.session_state.messages_b):
-                    msg_b = st.session_state.messages_b[i+1]
-                    with st.chat_message(msg_b["role"]):
-                         if "Error" in msg_b["content"]: st.error(msg_b["content"])
-                         else: st.markdown(msg_b["content"])
+                msg_b = st.session_state.messages_b[i+1]
+                with st.chat_message(msg_b["role"]):
+                     if "Error" in msg_b["content"]: st.error(msg_b["content"])
+                     else: st.markdown(msg_b["content"])
             
             # Model C
             with c3:
@@ -448,8 +446,7 @@ if prompt:
         else:
             gpt_system = f"{system_prompt}\n\n[DOCUMENT PROVIDED AS PDF file. Use that document only.]"
 
-        # Prepare Histories
-        history_gpt5 = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages_gpt5]
+        # Prepare Histories (Removed history_gpt5)
         history_gpt5_1 = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages_gpt5_1]
 
         history_b_sdk = build_gemini_history(st.session_state.messages_b)
@@ -461,18 +458,12 @@ if prompt:
             gemini_sys_instruct = system_prompt
 
         # 5. RUN MODELS (Show spinners in aligned columns)
-        c1, c2, c3 = st.columns(3)
-        with c1: st.subheader(f"🟢 {MODEL_GPT5}")
+        c2, c3 = st.columns(2)
         with c2: st.subheader(f"🔵 {MODEL_B}")
         with c3: st.subheader(f"🟣 {MODEL_GPT5_1}")
 
-        with st.spinner("⚔️ 3 Models are dueling..."):
+        with st.spinner("⚔️ 2 Models are dueling..."):
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                # GPT-5 Mini
-                future_gpt5 = executor.submit(
-                    call_gpt5_via_responses, MODEL_GPT5, openai_client, gpt_system, history_gpt5, prompt, file_id
-                )
-
                 # Gemini
                 if GEMINI_API_KEY:
                     future_b = executor.submit(
@@ -486,7 +477,6 @@ if prompt:
                     call_gpt5_via_responses, MODEL_GPT5_1, openai_client, gpt_system, history_gpt5_1, prompt, file_id
                 )
 
-                result_gpt5 = future_gpt5.result()
                 result_b = future_b.result() if future_b else None
                 result_gpt5_1 = future_gpt5_1.result()
 
@@ -506,12 +496,11 @@ if prompt:
                 st.session_state[msgs_key].append({'role': 'assistant', 'content': err_msg})
                 return err_msg
 
-        txt_gpt5 = update_state(result_gpt5, "messages_gpt5", "tokens_gpt5")
         txt_gemini = update_state(result_b, "messages_b", "tokens_b")
         txt_gpt5_1 = update_state(result_gpt5_1, "messages_gpt5_1", "tokens_gpt5_1")
 
         # 7. LOG TO GOOGLE SHEETS
-        log_to_google_sheet(prompt, txt_gpt5, txt_gemini, txt_gpt5_1)
+        log_to_google_sheet(prompt, txt_gemini, txt_gpt5_1)
 
         # 8. RERUN TO UPDATE UI (Layout will fix itself here)
         st.rerun()
@@ -520,14 +509,7 @@ if prompt:
 st.markdown("---")
 st.subheader("Usage summary")
 
-col_t1, col_t2, col_t3 = st.columns(3)
-
-with col_t1:
-    st.markdown(f"**{MODEL_GPT5}**")
-    st.markdown(f"- In: `{st.session_state.tokens_gpt5['input']}` / Out: `{st.session_state.tokens_gpt5['output']}`")
-    est_cost_gpt5 = ((st.session_state.tokens_gpt5['input'] / 1e6) * COST_GPT5_INPUT) + \
-                    ((st.session_state.tokens_gpt5['output'] / 1e6) * COST_GPT5_OUTPUT)
-    st.markdown(f"- Cost: **${est_cost_gpt5:.6f}**")
+col_t2, col_t3 = st.columns(2)
 
 with col_t2:
     st.markdown(f"**{MODEL_B}**")
@@ -544,5 +526,5 @@ with col_t3:
     st.markdown(f"- Cost: **${est_cost_gpt5_1:.6f}**")
 
 st.markdown("---")
-total_cost = est_cost_gpt5 + est_cost_b + est_cost_gpt5_1
+total_cost = est_cost_b + est_cost_gpt5_1
 st.markdown(f"### 📦 Grand Total Cost: ${total_cost:.6f}")
