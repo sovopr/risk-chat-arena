@@ -202,12 +202,14 @@ def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, is_scann
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            # UPDATED: Added thinking_config with thinking_level="low"
             response = client.models.generate_content(
                 model=model,
                 contents=history,
                 config=types.GenerateContentConfig(
                     system_instruction=sys_instruct,
                     temperature=0.7,
+                    thinking_config=types.ThinkingConfig(thinking_level="low"),
                     safety_settings=[
                         types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
                     ]
