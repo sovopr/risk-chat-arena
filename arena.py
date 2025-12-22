@@ -16,9 +16,9 @@ from google.genai import types
 st.set_page_config(page_title="Risk Chat Arena", layout="wide")
 
 # --- CONFIGURATION ---
-# Removed GPT-5 Mini
-MODEL_B = "gemini-3-pro-preview"   # Model B
-MODEL_GPT5_1 = "gpt-5.2"           # Model C
+MODEL_A = "gemini-3-flash-preview" # Model A (New - Column 1)
+MODEL_B = "gemini-3-pro-preview"   # Model B (Column 2)
+MODEL_GPT5_1 = "gpt-5.2"           # Model C (Column 3)
 MAX_TURNS = 30                     # Max questions per session
 GOOGLE_SHEET_NAME = "RiskArenaLogs" # Name of your Google Sheet
 
@@ -27,7 +27,8 @@ CHATGPT5_API_KEY = st.secrets.get("OPENAI_API_KEY")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
 
 # --- COST ASSUMPTIONS (per 1M tokens) ---
-# Removed GPT-5 Mini Costs
+COST_A_INPUT = 0.00
+COST_A_OUTPUT = 0.00
 COST_B_INPUT = 0.00
 COST_B_OUTPUT = 0.00
 COST_GPT5_1_INPUT = 0.00
@@ -41,7 +42,10 @@ def init_state(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
 
-# Model Histories (Removed messages_gpt5)
+# Model Histories
+init_state("messages_a", [])
+init_state("tokens_a", {"input": 0, "output": 0})
+
 init_state("messages_b", [])
 init_state("tokens_b", {"input": 0, "output": 0})
 
@@ -79,7 +83,7 @@ def get_gspread_client():
         st.error(f"❌ Google Auth Error: {e}")
         return None
 
-def log_to_google_sheet(question, r_gemini, r_gpt5_1):
+def log_to_google_sheet(question, r_flash, r_gemini, r_gpt5_1):
     """
     Appends the interaction data to the Google Sheet.
     """
@@ -95,8 +99,8 @@ def log_to_google_sheet(question, r_gemini, r_gpt5_1):
         try:
             val = sheet.acell('A1').value
             if not val:
-                # Removed GPT-5 Mini Header
-                headers = ["User ID", "Turn Number", "Timestamp", "Question", "Gemini-3-Pro", "GPT-5.2"]
+                # Updated Headers
+                headers = ["User ID", "Turn Number", "Timestamp", "Question", "Gemini-3-Flash", "Gemini-3-Pro", "GPT-5.2"]
                 sheet.append_row(headers)
         except:
             pass
@@ -108,6 +112,7 @@ def log_to_google_sheet(question, r_gemini, r_gpt5_1):
             st.session_state.turn_count,
             timestamp,
             question,
+            r_flash,
             r_gemini,
             r_gpt5_1
         ]
@@ -203,6 +208,7 @@ def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, is_scann
     for attempt in range(max_retries):
         try:
             # UPDATED: Added thinking_config with thinking_level="low"
+            # This applies to both Flash and Pro as requested
             response = client.models.generate_content(
                 model=model,
                 contents=history,
@@ -324,9 +330,9 @@ A factsheet contains generic data; the advisor’s job is to make it relevant to
 Rule 4: Utilize Visuals and Check for Understanding
 Visual aids are powerful tools for explanation. Advisors should use the charts and graphs present in the factsheet—such as the "NAV movement" or "Portfolio Allocation" pie chart—to visually demonstrate where the money is being invested. Crucially, the advisor must practice active listening and frequently pause to ask, "Does this make sense?" or "How do you feel about this risk level?" to verify the novice investor truly comprehends the information rather than just nodding along.
 Operational rules for every response:
-•	Stay within the mutual fund factsheet (and references inside it, e.g., SID/SAI/KIM if mentioned). Do not answer questions outside the scope of the mutual fund factsheet. If asked, say: “Out of scope for factsheet-based discussion” Or “Not stated in the document.”
-•	Keep answers clear and concise. Include a brief real-world example only when it improves understanding (no hype, no guarantees).
-•	Do not wait for the investor to ask about features of the mutual fund. Proactively identify and explain essential concepts from the factsheet—to ensure the investor has the foundational knowledge needed to make an informed decision.
+•   Stay within the mutual fund factsheet (and references inside it, e.g., SID/SAI/KIM if mentioned). Do not answer questions outside the scope of the mutual fund factsheet. If asked, say: “Out of scope for factsheet-based discussion” Or “Not stated in the document.”
+•   Keep answers clear and concise. Include a brief real-world example only when it improves understanding (no hype, no guarantees).
+•   Do not wait for the investor to ask about features of the mutual fund. Proactively identify and explain essential concepts from the factsheet—to ensure the investor has the foundational knowledge needed to make an informed decision.
 """
 
     system_prompt = st.text_area("System Instructions", value=default_prompt, height=250)
@@ -337,9 +343,13 @@ Operational rules for every response:
     def calc_cost(tokens, input_cost, output_cost):
         return ((tokens['input'] / 1e6) * input_cost) + ((tokens['output'] / 1e6) * output_cost)
 
-    # 1. GPT-5 Mini (Removed)
+    # 1. Gemini Flash
+    cost_a = calc_cost(st.session_state.tokens_a, COST_A_INPUT, COST_A_OUTPUT)
+    st.markdown(f"**⚡ {MODEL_A}**")
+    st.markdown(f"💵 **${cost_a:.4f}**")
+    st.markdown("---")
 
-    # 2. Gemini
+    # 2. Gemini Pro
     cost_b = calc_cost(st.session_state.tokens_b, COST_B_INPUT, COST_B_OUTPUT)
     st.markdown(f"**🔵 {MODEL_B}**")
     st.markdown(f"💵 **${cost_b:.4f}**")
@@ -352,6 +362,7 @@ Operational rules for every response:
 
     if st.button("Reset Conversation"):
         keys_to_reset = [
+            "messages_a", "tokens_a",
             "messages_b", "tokens_b",
             "messages_gpt5_1", "tokens_gpt5_1",
             "openai_file_cache", "turn_count"
@@ -366,11 +377,11 @@ Operational rules for every response:
         st.session_state.user_id = str(uuid.uuid4())
         st.rerun()
 
-# --- UI (UPDATED: ROW-BASED LAYOUT) ---
-st.title("🛡️ Conversational Risk Arena (Dual-Model Duel)")
+# --- UI (UPDATED: THREE MODEL LAYOUT) ---
+st.title("🛡️ Conversational Risk Arena (Triple-Model Duel)")
 
-# Iterate through history by turn (User -> 2 Assistants)
-# We use messages_b as the master list for length
+# Iterate through history by turn (User -> 3 Assistants)
+# We use messages_b as the master list for length (assuming synchronization)
 if "messages_b" in st.session_state and len(st.session_state.messages_b) > 0:
     for i in range(0, len(st.session_state.messages_b), 2):
         
@@ -379,11 +390,20 @@ if "messages_b" in st.session_state and len(st.session_state.messages_b) > 0:
         with st.chat_message("user"):
             st.markdown(user_content)
             
-        # 2. DISPLAY 2 MODEL ANSWERS (Columns below the question)
+        # 2. DISPLAY 3 MODEL ANSWERS (Columns below the question)
         if i + 1 < len(st.session_state.messages_b):
-            c2, c3 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             
-            # Model B
+            # Model A (Flash)
+            with c1:
+                st.subheader(f"⚡ {MODEL_A}")
+                if i+1 < len(st.session_state.messages_a):
+                    msg_a = st.session_state.messages_a[i+1]
+                    with st.chat_message(msg_a["role"]):
+                        if "Error" in msg_a["content"]: st.error(msg_a["content"])
+                        else: st.markdown(msg_a["content"])
+
+            # Model B (Pro)
             with c2:
                 st.subheader(f"🔵 {MODEL_B}")
                 msg_b = st.session_state.messages_b[i+1]
@@ -391,7 +411,7 @@ if "messages_b" in st.session_state and len(st.session_state.messages_b) > 0:
                      if "Error" in msg_b["content"]: st.error(msg_b["content"])
                      else: st.markdown(msg_b["content"])
             
-            # Model C
+            # Model C (GPT 5.2)
             with c3:
                 st.subheader(f"🟣 {MODEL_GPT5_1}")
                 if i+1 < len(st.session_state.messages_gpt5_1):
@@ -441,9 +461,14 @@ if prompt:
         else:
             gpt_system = f"{system_prompt}\n\n[DOCUMENT PROVIDED AS PDF file. Use that document only.]"
 
-        # Prepare Histories (Removed history_gpt5)
+        # Prepare Histories
         history_gpt5_1 = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages_gpt5_1]
 
+        # History for Model A (Flash)
+        history_a_sdk = build_gemini_history(st.session_state.messages_a)
+        history_a_sdk.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+
+        # History for Model B (Pro)
         history_b_sdk = build_gemini_history(st.session_state.messages_b)
         history_b_sdk.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
         
@@ -453,13 +478,22 @@ if prompt:
             gemini_sys_instruct = system_prompt
 
         # 5. RUN MODELS (Show spinners in aligned columns)
-        c2, c3 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
+        with c1: st.subheader(f"⚡ {MODEL_A}")
         with c2: st.subheader(f"🔵 {MODEL_B}")
         with c3: st.subheader(f"🟣 {MODEL_GPT5_1}")
 
-        with st.spinner("⚔️ 2 Models are dueling..."):
+        with st.spinner("⚔️ 3 Models are dueling..."):
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                # Gemini
+                # Gemini Flash (Model A)
+                if GEMINI_API_KEY:
+                    future_a = executor.submit(
+                        call_gemini, MODEL_A, GEMINI_API_KEY, history_a_sdk, gemini_sys_instruct, fact_sheet_bytes, is_scanned_pdf
+                    )
+                else:
+                    future_a = None
+
+                # Gemini Pro (Model B)
                 if GEMINI_API_KEY:
                     future_b = executor.submit(
                         call_gemini, MODEL_B, GEMINI_API_KEY, history_b_sdk, gemini_sys_instruct, fact_sheet_bytes, is_scanned_pdf
@@ -467,11 +501,12 @@ if prompt:
                 else:
                     future_b = None
                 
-                # GPT-5.1
+                # GPT-5.1 (Model C)
                 future_gpt5_1 = executor.submit(
                     call_gpt5_via_responses, MODEL_GPT5_1, openai_client, gpt_system, history_gpt5_1, prompt, file_id
                 )
 
+                result_a = future_a.result() if future_a else None
                 result_b = future_b.result() if future_b else None
                 result_gpt5_1 = future_gpt5_1.result()
 
@@ -491,11 +526,12 @@ if prompt:
                 st.session_state[msgs_key].append({'role': 'assistant', 'content': err_msg})
                 return err_msg
 
+        txt_flash = update_state(result_a, "messages_a", "tokens_a")
         txt_gemini = update_state(result_b, "messages_b", "tokens_b")
         txt_gpt5_1 = update_state(result_gpt5_1, "messages_gpt5_1", "tokens_gpt5_1")
 
         # 7. LOG TO GOOGLE SHEETS
-        log_to_google_sheet(prompt, txt_gemini, txt_gpt5_1)
+        log_to_google_sheet(prompt, txt_flash, txt_gemini, txt_gpt5_1)
 
         # 8. RERUN TO UPDATE UI (Layout will fix itself here)
         st.rerun()
@@ -504,7 +540,14 @@ if prompt:
 st.markdown("---")
 st.subheader("Usage summary")
 
-col_t2, col_t3 = st.columns(2)
+col_t1, col_t2, col_t3 = st.columns(3)
+
+with col_t1:
+    st.markdown(f"**{MODEL_A}**")
+    st.markdown(f"- In: `{st.session_state.tokens_a['input']}` / Out: `{st.session_state.tokens_a['output']}`")
+    est_cost_a = ((st.session_state.tokens_a['input'] / 1e6) * COST_A_INPUT) + \
+                 ((st.session_state.tokens_a['output'] / 1e6) * COST_A_OUTPUT)
+    st.markdown(f"- Cost: **${est_cost_a:.6f}**")
 
 with col_t2:
     st.markdown(f"**{MODEL_B}**")
@@ -521,5 +564,5 @@ with col_t3:
     st.markdown(f"- Cost: **${est_cost_gpt5_1:.6f}**")
 
 st.markdown("---")
-total_cost = est_cost_b + est_cost_gpt5_1
+total_cost = est_cost_a + est_cost_b + est_cost_gpt5_1
 st.markdown(f"### 📦 Grand Total Cost: ${total_cost:.6f}")
