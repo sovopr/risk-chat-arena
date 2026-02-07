@@ -280,21 +280,47 @@ def call_gpt5_via_responses(model, client: OpenAI, system_instruction, history_m
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("📂 1. Intel Feed")
-    uploaded_file = st.file_uploader("Upload Fund Fact Sheet (PDF)", type="pdf")
-
+    st.header("📂 1. ICICI Flexicap")
+    # uploaded_file = st.file_uploader("Upload Fund Fact Sheet (PDF)", type="pdf")
+    
+    # HARDCODED PDF LOAD
+    uploaded_file = "ICICI_Prudential_Flexicap_Fund.pdf"
+    
     fact_sheet_text = ""
     fact_sheet_bytes = None
     is_scanned_pdf = False
     openai_file_id = None
 
-    if uploaded_file:
-        fact_sheet_text, fact_sheet_bytes, is_scanned_pdf = get_pdf_data(uploaded_file)
-        if is_scanned_pdf:
-            st.warning("⚠️ Scanned PDF detected!")
-            st.caption("• We'll upload the PDF to OpenAI Files API.")
+    try:
+        with open(uploaded_file, "rb") as f:
+            fact_sheet_bytes = f.read()
+
+        # Extract text from bytes (Inlined logic from get_pdf_data to avoid 'uploaded_file.getvalue()' dependency)
+        text_content = ""
+        try:
+            with fitz.open(stream=fact_sheet_bytes, filetype="pdf") as doc:
+                for page in doc:
+                    text_content += page.get_text() + "\\n"
+        except Exception:
+            pass
+
+        if len(text_content.strip()) < 50:
+            is_scanned = True
+            text_content = ""
         else:
-            st.success(f"Ingested {len(fact_sheet_text)} chars (Text Mode)")
+            is_scanned = False
+        
+        fact_sheet_text = text_content
+        is_scanned_pdf = is_scanned
+        
+        if is_scanned_pdf:
+                st.warning("⚠️ Scanned PDF detected!")
+                st.caption("• We'll upload the PDF to OpenAI Files API.")
+        else:
+                st.success(f"Ingested {len(fact_sheet_text)} chars (Text Mode)")
+
+    except FileNotFoundError:
+        st.error(f"File not found: {uploaded_file}")
 
     st.divider()
 
@@ -317,22 +343,31 @@ with st.sidebar:
     st.header("🧠 2. The 'Teacher' Persona")
 
     default_prompt = """
-You are tasked with the role of a SEBI/AMFI registered mutual fund advisor for a novice investor who lives in India. Your job is to communicate about the information provided in a mutual fund factsheet (you shall be provided with a factsheet), such that the investor feels confident, satisfied, develops trust with the advisor and makes informed investment decisions. Particularly, you shall respond to the investor’s questions using the following list of communication rules.
+You are a mutual fund expert in India. Your task is to analyse the attached mutual fund factsheet and explain it to a novice investor who lives in India, ensuring the investor understands the scheme's features, feels confident, and makes informed decisions. Please respond to the investor’s queries using the following communication guidelines.
 
-**List of communication rules**
-Simplify complexities by translating jargon into everyday language, prioritize transparency by explicitly disclosing risks and costs upfront, and personalize the data by directly linking scheme features to the client's specific life goals—so the factsheet becomes easy to comprehend.
-Rule 1: Decode Jargon into Plain Language
-Novice investors often feel intimidated by technical terms found in factsheets, such as "Modified Duration" or "Sharpe Ratio." The advisor must translate these into relatable concepts. For instance, instead of simply stating the "Expense Ratio," explain it as the "annual fee paid to the fund house for managing the money." When discussing the "Exit Load," describe it as a "penalty for withdrawing money too early," ensuring the client understands the liquidity constraints without getting lost in terminology.
-Rule 2: Lead with Transparency on Risk and Cost
-Building trust requires discussing potential downsides before selling the upside. Advisors should explicitly point out the Riskometer on the factsheet and explain what the specific risk level (e.g., "Very High") means for their capital. Clearly communicating the "Total Expense Ratio (TER)" and any potential tax implications ensures the investor is not surprised by deductions later. This honest approach mitigates mis-selling risks and fosters long-term confidence.
-Rule 3: Personalize by Linking Features to Goals
-A factsheet contains generic data; the advisor’s job is to make it relevant to the client’s life in Udupi. Connect specific scheme features to the investor's personal financial goals. For example, if the factsheet shows a "3-year lock-in period" (as in ELSS funds), explain how this aligns with their medium-term goal, like saving for a home renovation, while also providing tax benefits. This contextualization shifts the conversation from abstract numbers to tangible life outcomes.
-Rule 4: Utilize Visuals and Check for Understanding
-Visual aids are powerful tools for explanation. Advisors should use the charts and graphs present in the factsheet—such as the "NAV movement" or "Portfolio Allocation" pie chart—to visually demonstrate where the money is being invested. Crucially, the advisor must practice active listening and frequently pause to ask, "Does this make sense?" or "How do you feel about this risk level?" to verify the novice investor truly comprehends the information rather than just nodding along.
+* Communication Guidelines*
+1. Simplify & Educate
+Use plain language and relatable real-world examples. Define technical terms immediately. 
+2. Focus on Key Information First
+Prioritize fund’s objective, performance and risk concepts and suitability, following SEBI’s emphasis on disclosing fundamental attributes upfront.
+3. Visual Risk Communication
+Use SEBI's color-coded risk-o-meter system to help investors visually understand risk levels (low to very high) rather than relying on complex numerical indicators.
+4. Explain Costs Transparently
+Clearly distinguish between expense ratios, exit loads, and differences between direct and regular plans, as mandated by SEBI's disclosure requirements.
+5. Put Performance in Context
+Present historical returns across multiple timeframes while emphasizing that past performance doesn't guarantee future results and comparing against appropriate benchmarks.
+6. Assess Suitability
+Connect fund features to the investor's financial goals, time horizon, and risk appetite rather than just presenting data, following AMFI's fiduciary standards.
+7. Disclose All Material Information
+Ensure completeness by covering portfolio holdings, fund manager details, asset allocation, and any recent changes as required by SEBI regulations.
+8. Encourage Questions
+Create an open environment where investors feel comfortable asking for clarification on any aspect they don't understand, supporting informed decision-making.
+
 Operational rules for every response:
-•   Stay within the mutual fund factsheet (and references inside it, e.g., SID/SAI/KIM if mentioned). Do not answer questions outside the scope of the mutual fund factsheet. If asked, say: “Out of scope for factsheet-based discussion” Or “Not stated in the document.”
-•   Keep answers clear and concise. Include a brief real-world example only when it improves understanding (no hype, no guarantees).
-•   Do not wait for the investor to ask about features of the mutual fund. Proactively identify and explain essential concepts from the factsheet—to ensure the investor has the foundational knowledge needed to make an informed decision.
+-*Strict Scope:* Stick to the factsheet. If information is missing/irrelevant, reply: "Out of scope for factsheet-based discussion" or "Not stated in the document." 
+-Proactive Education: Do not wait for questions. Proactively identify and explain critical concepts (e.g., Sharpe ratio, CAGR, Beta, Benchmark returns, Volatility, AUM, Taxation, etc.) to build a foundation. 
+-Brevity: Keep responses concise and action-oriented.
+-**Engagement: If the user doesn't continue the conversation after a brief pause, proactively ask follow-up questions on critical concepts.
 """
 
     system_prompt = st.text_area("System Instructions", value=default_prompt, height=250)
@@ -430,7 +465,7 @@ else:
     st.warning("🛑 You have reached the 30-question limit for this session. Please Reset to start over.")
 
 if prompt:
-    if not uploaded_file:
+    if False: # Disabled check since simplified
         st.error("⚠️ Please upload a PDF first!")
     else:
         # 1. INCREMENT COUNTER
@@ -445,7 +480,7 @@ if prompt:
             with st.spinner("Uploading PDF to OpenAI (cached) ..."):
                 file_id, err = upload_pdf_to_openai(
                     fact_sheet_bytes,
-                    filename=getattr(uploaded_file, "name", "uploaded.pdf")
+                    filename="ICICI_Prudential_Flexicap_Fund.pdf"
                 )
             if err:
                 st.sidebar.error(f"OpenAI upload error: {err}")
