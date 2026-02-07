@@ -12,6 +12,7 @@ from datetime import datetime
 from openai import OpenAI
 from google import genai
 from google.genai import types
+import os
 
 st.set_page_config(page_title="Risk Chat Arena", layout="wide")
 
@@ -280,11 +281,11 @@ def call_gpt5_via_responses(model, client: OpenAI, system_instruction, history_m
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("📂 1. ICICI Flexicap")
+    st.header("📂 1. Kotak Flexicap")
     # uploaded_file = st.file_uploader("Upload Fund Fact Sheet (PDF)", type="pdf")
     
     # HARDCODED PDF LOAD
-    uploaded_file = "ICICI_Prudential_Flexicap_Fund.pdf"
+    uploaded_file = os.path.join(os.path.dirname(__file__), "KOTAK FLEXICAP FUND.pdf")
     
     fact_sheet_text = ""
     fact_sheet_bytes = None
@@ -480,7 +481,7 @@ if prompt:
             with st.spinner("Uploading PDF to OpenAI (cached) ..."):
                 file_id, err = upload_pdf_to_openai(
                     fact_sheet_bytes,
-                    filename="ICICI_Prudential_Flexicap_Fund.pdf"
+                    filename=os.path.basename(uploaded_file)
                 )
             if err:
                 st.sidebar.error(f"OpenAI upload error: {err}")
