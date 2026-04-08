@@ -1,15 +1,12 @@
 import streamlit as st
 import time
 import concurrent.futures
-import io
-import fitz  # PyMuPDF
-import tempfile
-import hashlib
 import uuid
 import gspread
+import base64
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
-from openai import OpenAI
+import anthropic
 from google import genai
 from google.genai import types
 import os
@@ -17,14 +14,14 @@ import os
 st.set_page_config(page_title="Risk Chat Arena", layout="wide")
 
 # --- CONFIGURATION ---
-MODEL_A = "gemini-3-flash-preview" # Model A (New - Column 1)
-MODEL_B = "gemini-3-pro-preview"   # Model B (Column 2)
-MODEL_GPT5_1 = "gpt-5.2"           # Model C (Column 3)
-MAX_TURNS = 30                     # Max questions per session
-GOOGLE_SHEET_NAME = "RiskArenaLogs" # Name of your Google Sheet
+MODEL_A = "gemini-3-flash-preview"             # Model A (Column 1)
+MODEL_B = "gemini-3.1-flash-lite-preview"      # Model B (Column 2)
+MODEL_CLAUDE = "claude-3-5-haiku-20241022"     # Model C (Column 3)
+MAX_TURNS = 30                         # Max questions per session
+GOOGLE_SHEET_NAME = "RiskArenaLogs"    # Name of your Google Sheet
 
 # ✅ API KEYS
-CHATGPT5_API_KEY = st.secrets.get("OPENAI_API_KEY") 
+ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY") 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
 
 # --- COST ASSUMPTIONS (per 1M tokens) ---
@@ -32,11 +29,11 @@ COST_A_INPUT = 0.00
 COST_A_OUTPUT = 0.00
 COST_B_INPUT = 0.00
 COST_B_OUTPUT = 0.00
-COST_GPT5_1_INPUT = 0.00
-COST_GPT5_1_OUTPUT = 0.00
+COST_CLAUDE_INPUT = 0.00
+COST_CLAUDE_OUTPUT = 0.00
 
 # --- SDK CLIENTS ---
-openai_client = OpenAI(api_key=CHATGPT5_API_KEY) if CHATGPT5_API_KEY else None
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # --- SESSION STATE INITIALIZATION ---
 def init_state(key, default):
@@ -50,11 +47,8 @@ init_state("tokens_a", {"input": 0, "output": 0})
 init_state("messages_b", [])
 init_state("tokens_b", {"input": 0, "output": 0})
 
-init_state("messages_gpt5_1", [])
-init_state("tokens_gpt5_1", {"input": 0, "output": 0})
-
-# File Caching
-init_state("openai_file_cache", {})
+init_state("messages_claude", [])
+init_state("tokens_claude", {"input": 0, "output": 0})
 
 # User Logic
 init_state("user_id", str(uuid.uuid4())) # Unique ID for this session
@@ -62,16 +56,11 @@ init_state("turn_count", 0)              # Counts questions asked (0 to 30)
 
 # --- GOOGLE SHEETS LOGGING ---
 def get_gspread_client():
-    """
-    Authenticates with Google Sheets using the single JSON key in secrets.
-    """
     try:
         scope = [
             "https://spreadsheets.google.com/feeds",
             "https://www.googleapis.com/auth/drive"
         ]
-        
-        # Load credentials from st.secrets dictionary
         if "gcp_service_account" not in st.secrets:
             st.error("❌ Missing [gcp_service_account] in secrets.")
             return None
@@ -84,29 +73,21 @@ def get_gspread_client():
         st.error(f"❌ Google Auth Error: {e}")
         return None
 
-def log_to_google_sheet(question, r_flash, r_gemini, r_gpt5_1):
-    """
-    Appends the interaction data to the Google Sheet.
-    """
+def log_to_google_sheet(question, r_flash, r_gemini, r_claude):
     client = get_gspread_client()
     if not client:
         return
 
     try:
-        # Open the spreadsheet by name
         sheet = client.open(GOOGLE_SHEET_NAME).sheet1
-        
-        # Check if headers exist (simple check: is A1 empty?)
         try:
             val = sheet.acell('A1').value
             if not val:
-                # Updated Headers
-                headers = ["User ID", "Turn Number", "Timestamp", "Question", "Gemini-3-Flash", "Gemini-3-Pro", "GPT-5.2"]
+                headers = ["User ID", "Turn Number", "Timestamp", "Question", "Gemini-3-Flash", "Gemini-3.1-Lite", "Claude-Haiku"]
                 sheet.append_row(headers)
         except:
             pass
         
-        # Prepare row data
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         row = [
             st.session_state.user_id,
@@ -115,67 +96,11 @@ def log_to_google_sheet(question, r_flash, r_gemini, r_gpt5_1):
             question,
             r_flash,
             r_gemini,
-            r_gpt5_1
+            r_claude
         ]
-        
-        # Append the row
         sheet.append_row(row)
-        
     except Exception as e:
         st.warning(f"⚠️ Data Log Warning: Could not save to Google Sheet. ({e})")
-
-# --- PDF HELPERS ---
-def get_pdf_data(uploaded_file):
-    text_content = ""
-    file_bytes = uploaded_file.getvalue()
-    is_scanned = False
-
-    try:
-        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            for page in doc:
-                text_content += page.get_text() + "\n"
-    except Exception:
-        pass
-
-    if len(text_content.strip()) < 50:
-        is_scanned = True
-        text_content = ""
-
-    return text_content, file_bytes, is_scanned
-
-def _hash_bytes(b: bytes):
-    h = hashlib.sha256()
-    h.update(b)
-    return h.hexdigest()
-
-def upload_pdf_to_openai(file_bytes: bytes, filename: str = "uploaded.pdf"):
-    if openai_client is None:
-        return None, "OpenAI client not configured"
-
-    h = _hash_bytes(file_bytes)
-    cache = st.session_state.openai_file_cache
-    if h in cache:
-        return cache[h], None
-
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp.flush()
-            tmp_name = tmp.name
-
-        resp = openai_client.files.create(
-            file=open(tmp_name, "rb"),
-            purpose="assistants"
-        )
-        file_id = getattr(resp, "id", None)
-        if not file_id and hasattr(resp, "to_dict"):
-            file_id = resp.to_dict().get("id")
-        
-        cache[h] = file_id
-        st.session_state.openai_file_cache = cache
-        return file_id, None
-    except Exception as e:
-        return None, str(e)
 
 # --- GEMINI CLIENT ---
 def build_gemini_history(messages):
@@ -190,7 +115,7 @@ def build_gemini_history(messages):
         ))
     return gemini_history
 
-def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, is_scanned=False):
+def call_gemini(model, api_key, history, sys_instruct, file_bytes=None):
     if not api_key:
         return {"success": False, "error": "Gemini API key not configured"}
 
@@ -199,24 +124,20 @@ def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, is_scann
         http_options=types.HttpOptions(api_version="v1beta")
     )
 
-    if is_scanned and file_bytes:
-        last_content = history[-1]
-        last_content.parts.append(
+    if file_bytes and len(history) > 0 and history[-1].role == "user":
+        history[-1].parts.append(
             types.Part.from_bytes(data=file_bytes, mime_type="application/pdf")
         )
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # UPDATED: Added thinking_config with thinking_level="low"
-            # This applies to both Flash and Pro as requested
             response = client.models.generate_content(
                 model=model,
                 contents=history,
                 config=types.GenerateContentConfig(
                     system_instruction=sys_instruct,
                     temperature=0.7,
-                    thinking_config=types.ThinkingConfig(thinking_level="low"),
                     safety_settings=[
                         types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
                     ]
@@ -240,34 +161,44 @@ def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, is_scann
                 continue
             return {"success": False, "error": str(e)}
 
-# --- OPENAI CLIENT (Standard Chat Completions with 120s Timeout) ---
-def call_gpt5_via_responses(model, client: OpenAI, system_instruction, history_messages, prompt, file_id=None):
+# --- CLAUDE CLIENT ---
+def call_claude(model, client: anthropic.Anthropic, system_instruction, history_messages, prompt, file_bytes=None):
     if client is None:
-        return {"success": False, "error": "OpenAI client not configured"}
+        return {"success": False, "error": "Anthropic client not configured"}
 
-    # 1. Build the standard messages list
-    messages = [
-        {"role": "system", "content": system_instruction}
-    ]
-
-    # 2. Add History
+    messages = []
     for m in history_messages:
         messages.append({"role": m["role"], "content": str(m["content"])})
 
-    # 3. Add Current User Prompt
-    messages.append({"role": "user", "content": prompt})
+    user_content = []
+    
+    # Pass the native PDF via base64 encoding to Anthropic
+    if file_bytes:
+        pdf_data = base64.b64encode(file_bytes).decode("utf-8")
+        user_content.append({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": pdf_data
+            }
+        })
+        
+    user_content.append({"type": "text", "text": prompt})
+    messages.append({"role": "user", "content": user_content})
 
     try:
-        # Standard Chat Completion Call with increased timeout
-        resp = client.chat.completions.create(
+        resp = client.messages.create(
             model=model,
+            system=system_instruction,
             messages=messages,
-            timeout=120 
+            max_tokens=2048,
+            extra_headers={"anthropic-beta": "pdfs-2024-09-25"}
         )
         
-        content = resp.choices[0].message.content
-        input_tokens = resp.usage.prompt_tokens if resp.usage else 0
-        output_tokens = resp.usage.completion_tokens if resp.usage else 0
+        content = resp.content[0].text
+        input_tokens = resp.usage.input_tokens
+        output_tokens = resp.usage.output_tokens
 
         return {
             "success": True, 
@@ -282,44 +213,14 @@ def call_gpt5_via_responses(model, client: OpenAI, system_instruction, history_m
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("📂 1. Kotak Flexicap")
-    # uploaded_file = st.file_uploader("Upload Fund Fact Sheet (PDF)", type="pdf")
     
-    # HARDCODED PDF LOAD
     uploaded_file = os.path.join(os.path.dirname(__file__), "KOTAK FLEXICAP FUND.pdf")
-    
-    fact_sheet_text = ""
     fact_sheet_bytes = None
-    is_scanned_pdf = False
-    openai_file_id = None
 
     try:
         with open(uploaded_file, "rb") as f:
             fact_sheet_bytes = f.read()
-
-        # Extract text from bytes (Inlined logic from get_pdf_data to avoid 'uploaded_file.getvalue()' dependency)
-        text_content = ""
-        try:
-            with fitz.open(stream=fact_sheet_bytes, filetype="pdf") as doc:
-                for page in doc:
-                    text_content += page.get_text() + "\\n"
-        except Exception:
-            pass
-
-        if len(text_content.strip()) < 50:
-            is_scanned = True
-            text_content = ""
-        else:
-            is_scanned = False
-        
-        fact_sheet_text = text_content
-        is_scanned_pdf = is_scanned
-        
-        if is_scanned_pdf:
-                st.warning("⚠️ Scanned PDF detected!")
-                st.caption("• We'll upload the PDF to OpenAI Files API.")
-        else:
-                st.success(f"Ingested {len(fact_sheet_text)} chars (Text Mode)")
-
+        st.success("PDF loaded natively (No extraction required).")
     except FileNotFoundError:
         st.error(f"File not found: {uploaded_file}")
 
@@ -368,7 +269,7 @@ Operational rules for every response:
 -*Strict Scope:* Stick to the factsheet. If information is missing/irrelevant, reply: "Out of scope for factsheet-based discussion" or "Not stated in the document." 
 -Proactive Education: Do not wait for questions. Proactively identify and explain critical concepts (e.g., Sharpe ratio, CAGR, Beta, Benchmark returns, Volatility, AUM, Taxation, etc.) to build a foundation. 
 -Brevity: Keep responses concise and action-oriented.
--**Engagement: If the user doesn't continue the conversation after a brief pause, proactively ask follow-up questions on critical concepts.
+-**Engagement:** If the user doesn't continue the conversation after a brief pause, proactively ask follow-up questions on critical concepts.
 """
 
     system_prompt = st.text_area("System Instructions", value=default_prompt, height=250)
@@ -379,58 +280,49 @@ Operational rules for every response:
     def calc_cost(tokens, input_cost, output_cost):
         return ((tokens['input'] / 1e6) * input_cost) + ((tokens['output'] / 1e6) * output_cost)
 
-    # 1. Gemini Flash
     cost_a = calc_cost(st.session_state.tokens_a, COST_A_INPUT, COST_A_OUTPUT)
     st.markdown(f"**⚡ {MODEL_A}**")
     st.markdown(f"💵 **${cost_a:.4f}**")
     st.markdown("---")
 
-    # 2. Gemini Pro
     cost_b = calc_cost(st.session_state.tokens_b, COST_B_INPUT, COST_B_OUTPUT)
     st.markdown(f"**🔵 {MODEL_B}**")
     st.markdown(f"💵 **${cost_b:.4f}**")
     st.markdown("---")
 
-    # 3. GPT-5.1
-    cost_gpt5_1 = calc_cost(st.session_state.tokens_gpt5_1, COST_GPT5_1_INPUT, COST_GPT5_1_OUTPUT)
-    st.markdown(f"**🟣 {MODEL_GPT5_1}**")
-    st.markdown(f"💵 **${cost_gpt5_1:.4f}**")
+    cost_claude = calc_cost(st.session_state.tokens_claude, COST_CLAUDE_INPUT, COST_CLAUDE_OUTPUT)
+    st.markdown(f"**🟣 {MODEL_CLAUDE}**")
+    st.markdown(f"💵 **${cost_claude:.4f}**")
 
     if st.button("Reset Conversation"):
         keys_to_reset = [
             "messages_a", "tokens_a",
             "messages_b", "tokens_b",
-            "messages_gpt5_1", "tokens_gpt5_1",
-            "openai_file_cache", "turn_count"
+            "messages_claude", "tokens_claude",
+            "turn_count"
         ]
         for k in keys_to_reset:
             if k in st.session_state:
                 if "messages" in k: st.session_state[k] = []
                 if "tokens" in k: st.session_state[k] = {"input": 0, "output": 0}
-                if k == "openai_file_cache": st.session_state[k] = {}
                 if k == "turn_count": st.session_state[k] = 0
         
         st.session_state.user_id = str(uuid.uuid4())
         st.rerun()
 
-# --- UI (UPDATED: THREE MODEL LAYOUT) ---
+# --- UI (THREE MODEL LAYOUT) ---
 st.title("🛡️ Conversational Risk Arena (Triple-Model Duel)")
 
-# Iterate through history by turn (User -> 3 Assistants)
-# We use messages_b as the master list for length (assuming synchronization)
 if "messages_b" in st.session_state and len(st.session_state.messages_b) > 0:
     for i in range(0, len(st.session_state.messages_b), 2):
         
-        # 1. DISPLAY USER QUESTION (Full Width)
         user_content = st.session_state.messages_b[i]["content"]
         with st.chat_message("user"):
             st.markdown(user_content)
             
-        # 2. DISPLAY 3 MODEL ANSWERS (Columns below the question)
         if i + 1 < len(st.session_state.messages_b):
             c1, c2, c3 = st.columns(3)
             
-            # Model A (Flash)
             with c1:
                 st.subheader(f"⚡ {MODEL_A}")
                 if i+1 < len(st.session_state.messages_a):
@@ -439,7 +331,6 @@ if "messages_b" in st.session_state and len(st.session_state.messages_b) > 0:
                         if "Error" in msg_a["content"]: st.error(msg_a["content"])
                         else: st.markdown(msg_a["content"])
 
-            # Model B (Pro)
             with c2:
                 st.subheader(f"🔵 {MODEL_B}")
                 msg_b = st.session_state.messages_b[i+1]
@@ -447,16 +338,15 @@ if "messages_b" in st.session_state and len(st.session_state.messages_b) > 0:
                      if "Error" in msg_b["content"]: st.error(msg_b["content"])
                      else: st.markdown(msg_b["content"])
             
-            # Model C (GPT 5.2)
             with c3:
-                st.subheader(f"🟣 {MODEL_GPT5_1}")
-                if i+1 < len(st.session_state.messages_gpt5_1):
-                    msg_c = st.session_state.messages_gpt5_1[i+1]
+                st.subheader(f"🟣 {MODEL_CLAUDE}")
+                if i+1 < len(st.session_state.messages_claude):
+                    msg_c = st.session_state.messages_claude[i+1]
                     with st.chat_message(msg_c["role"]):
                          if "Error" in msg_c["content"]: st.error(msg_c["content"])
                          else: st.markdown(msg_c["content"])
             
-            st.divider() # Clean separation for the next turn
+            st.divider()
 
 # --- INPUT LOGIC ---
 if st.session_state.turn_count < MAX_TURNS:
@@ -466,111 +356,66 @@ else:
     st.warning("🛑 You have reached the 30-question limit for this session. Please Reset to start over.")
 
 if prompt:
-    if False: # Disabled check since simplified
-        st.error("⚠️ Please upload a PDF first!")
-    else:
-        # 1. INCREMENT COUNTER
-        st.session_state.turn_count += 1
+    st.session_state.turn_count += 1
 
-        # 2. ECHO PROMPT TEMPORARILY (Full Width)
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-        # 3. UPLOAD FILE IF NEEDED
-        if fact_sheet_bytes:
-            with st.spinner("Uploading PDF to OpenAI (cached) ..."):
-                file_id, err = upload_pdf_to_openai(
-                    fact_sheet_bytes,
-                    filename=os.path.basename(uploaded_file)
+    history_claude = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages_claude]
+
+    history_a_sdk = build_gemini_history(st.session_state.messages_a)
+    history_a_sdk.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+
+    history_b_sdk = build_gemini_history(st.session_state.messages_b)
+    history_b_sdk.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+
+    c1, c2, c3 = st.columns(3)
+    with c1: st.subheader(f"⚡ {MODEL_A}")
+    with c2: st.subheader(f"🔵 {MODEL_B}")
+    with c3: st.subheader(f"🟣 {MODEL_CLAUDE}")
+
+    with st.spinner("⚔️ 3 Models are dueling natively with the PDF..."):
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            if GEMINI_API_KEY:
+                future_a = executor.submit(
+                    call_gemini, MODEL_A, GEMINI_API_KEY, history_a_sdk, system_prompt, fact_sheet_bytes
                 )
-            if err:
-                st.sidebar.error(f"OpenAI upload error: {err}")
-                file_id = None
-            else:
-                st.sidebar.success(f"Uploaded to OpenAI as {file_id}")
-        else:
-            file_id = None
-
-        # 4. SYSTEM PROMPTS
-        if not is_scanned_pdf and fact_sheet_text:
-            gpt_system = f"{system_prompt}\n\nDOCUMENT CONTEXT:\n{fact_sheet_text}"
-        else:
-            gpt_system = f"{system_prompt}\n\n[DOCUMENT PROVIDED AS PDF file. Use that document only.]"
-
-        # Prepare Histories
-        history_gpt5_1 = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages_gpt5_1]
-
-        # History for Model A (Flash)
-        history_a_sdk = build_gemini_history(st.session_state.messages_a)
-        history_a_sdk.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
-
-        # History for Model B (Pro)
-        history_b_sdk = build_gemini_history(st.session_state.messages_b)
-        history_b_sdk.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
-        
-        if not is_scanned_pdf and fact_sheet_text:
-            gemini_sys_instruct = f"{system_prompt}\n\nDOCUMENT CONTEXT:\n{fact_sheet_text}"
-        else:
-            gemini_sys_instruct = system_prompt
-
-        # 5. RUN MODELS (Show spinners in aligned columns)
-        c1, c2, c3 = st.columns(3)
-        with c1: st.subheader(f"⚡ {MODEL_A}")
-        with c2: st.subheader(f"🔵 {MODEL_B}")
-        with c3: st.subheader(f"🟣 {MODEL_GPT5_1}")
-
-        with st.spinner("⚔️ 3 Models are dueling..."):
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                # Gemini Flash (Model A)
-                if GEMINI_API_KEY:
-                    future_a = executor.submit(
-                        call_gemini, MODEL_A, GEMINI_API_KEY, history_a_sdk, gemini_sys_instruct, fact_sheet_bytes, is_scanned_pdf
-                    )
-                else:
-                    future_a = None
-
-                # Gemini Pro (Model B)
-                if GEMINI_API_KEY:
-                    future_b = executor.submit(
-                        call_gemini, MODEL_B, GEMINI_API_KEY, history_b_sdk, gemini_sys_instruct, fact_sheet_bytes, is_scanned_pdf
-                    )
-                else:
-                    future_b = None
-                
-                # GPT-5.1 (Model C)
-                future_gpt5_1 = executor.submit(
-                    call_gpt5_via_responses, MODEL_GPT5_1, openai_client, gpt_system, history_gpt5_1, prompt, file_id
+                future_b = executor.submit(
+                    call_gemini, MODEL_B, GEMINI_API_KEY, history_b_sdk, system_prompt, fact_sheet_bytes
                 )
-
-                result_a = future_a.result() if future_a else None
-                result_b = future_b.result() if future_b else None
-                result_gpt5_1 = future_gpt5_1.result()
-
-        # 6. UPDATE STATE
-        def update_state(result, msgs_key, tokens_key):
-            if result is None:
-                return "(model unavailable)"
-            st.session_state[msgs_key].append({'role': 'user', 'content': prompt})
-            if result.get("success"):
-                content = result["content"]
-                st.session_state[msgs_key].append({'role': 'assistant', 'content': content})
-                st.session_state[tokens_key]['input'] += int(result.get("input_tokens", 0) or 0)
-                st.session_state[tokens_key]['output'] += int(result.get("output_tokens", 0) or 0)
-                return content
             else:
-                err_msg = f"⚠️ Error: {result.get('error', 'Unknown error')}"
-                st.session_state[msgs_key].append({'role': 'assistant', 'content': err_msg})
-                return err_msg
+                future_a = None
+                future_b = None
+            
+            future_claude = executor.submit(
+                call_claude, MODEL_CLAUDE, anthropic_client, system_prompt, history_claude, prompt, fact_sheet_bytes
+            )
 
-        txt_flash = update_state(result_a, "messages_a", "tokens_a")
-        txt_gemini = update_state(result_b, "messages_b", "tokens_b")
-        txt_gpt5_1 = update_state(result_gpt5_1, "messages_gpt5_1", "tokens_gpt5_1")
+            result_a = future_a.result() if future_a else None
+            result_b = future_b.result() if future_b else None
+            result_claude = future_claude.result()
 
-        # 7. LOG TO GOOGLE SHEETS
-        log_to_google_sheet(prompt, txt_flash, txt_gemini, txt_gpt5_1)
+    def update_state(result, msgs_key, tokens_key):
+        if result is None:
+            return "(model unavailable)"
+        st.session_state[msgs_key].append({'role': 'user', 'content': prompt})
+        if result.get("success"):
+            content = result["content"]
+            st.session_state[msgs_key].append({'role': 'assistant', 'content': content})
+            st.session_state[tokens_key]['input'] += int(result.get("input_tokens", 0) or 0)
+            st.session_state[tokens_key]['output'] += int(result.get("output_tokens", 0) or 0)
+            return content
+        else:
+            err_msg = f"⚠️ Error: {result.get('error', 'Unknown error')}"
+            st.session_state[msgs_key].append({'role': 'assistant', 'content': err_msg})
+            return err_msg
 
-        # 8. RERUN TO UPDATE UI (Layout will fix itself here)
-        st.rerun()
+    txt_flash = update_state(result_a, "messages_a", "tokens_a")
+    txt_gemini = update_state(result_b, "messages_b", "tokens_b")
+    txt_claude = update_state(result_claude, "messages_claude", "tokens_claude")
+
+    log_to_google_sheet(prompt, txt_flash, txt_gemini, txt_claude)
+    st.rerun()
 
 # --- BOTTOM: COST SUMMARY ---
 st.markdown("---")
@@ -593,12 +438,12 @@ with col_t2:
     st.markdown(f"- Cost: **${est_cost_b:.6f}**")
 
 with col_t3:
-    st.markdown(f"**{MODEL_GPT5_1}**")
-    st.markdown(f"- In: `{st.session_state.tokens_gpt5_1['input']}` / Out: `{st.session_state.tokens_gpt5_1['output']}`")
-    est_cost_gpt5_1 = ((st.session_state.tokens_gpt5_1['input'] / 1e6) * COST_GPT5_1_INPUT) + \
-                      ((st.session_state.tokens_gpt5_1['output'] / 1e6) * COST_GPT5_1_OUTPUT)
-    st.markdown(f"- Cost: **${est_cost_gpt5_1:.6f}**")
+    st.markdown(f"**{MODEL_CLAUDE}**")
+    st.markdown(f"- In: `{st.session_state.tokens_claude['input']}` / Out: `{st.session_state.tokens_claude['output']}`")
+    est_cost_claude = ((st.session_state.tokens_claude['input'] / 1e6) * COST_CLAUDE_INPUT) + \
+                      ((st.session_state.tokens_claude['output'] / 1e6) * COST_CLAUDE_OUTPUT)
+    st.markdown(f"- Cost: **${est_cost_claude:.6f}**")
 
 st.markdown("---")
-total_cost = est_cost_a + est_cost_b + est_cost_gpt5_1
+total_cost = est_cost_a + est_cost_b + est_cost_claude
 st.markdown(f"### 📦 Grand Total Cost: ${total_cost:.6f}")
