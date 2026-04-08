@@ -5,3 +5,4 @@ PyMuPDF
 tqdm
 gspread
 oauth2client
+anthropic
