@@ -16,7 +16,7 @@ st.set_page_config(page_title="Risk Chat Arena", layout="wide")
 # --- CONFIGURATION ---
 MODEL_A = "gemini-3-flash-preview"             # Model A (Column 1)
 MODEL_B = "gemini-3.1-flash-lite-preview"      # Model B (Column 2)
-MODEL_CLAUDE = "claude-3-5-haiku-20241022"     # Model C (Column 3)
+MODEL_CLAUDE = "claude-haiku-4-5-20251001"    # Model C (Column 3)
 MAX_TURNS = 30                         # Max questions per session
 GOOGLE_SHEET_NAME = "RiskArenaLogs"    # Name of your Google Sheet
 
