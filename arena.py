@@ -59,6 +59,7 @@ init_state("tokens_claude", {"input": 0, "output": 0, "cache_write": 0, "cache_r
 # User Logic
 init_state("user_id", str(uuid.uuid4())) 
 init_state("turn_count", 0)              
+init_state("factsheet_sent", False)      
 
 # --- GOOGLE SHEETS LOGGING ---
 def get_gspread_client():
@@ -105,23 +106,13 @@ def log_to_google_sheet(question, r_flash, r_gemini, r_claude):
             r_claude
         ]
         sheet.append_row(row)
+    except gspread.exceptions.APIError as e:
+        st.error(f"❌ Sheets Permission Denied: Make sure the GCP Service Account email has 'Editor' access to the Google Sheet '{GOOGLE_SHEET_NAME}'.")
     except Exception as e:
         st.warning(f"⚠️ Data Log Warning: Could not save to Google Sheet. ({e})")
 
 # --- GEMINI CLIENT ---
-def build_gemini_history(messages):
-    gemini_history = []
-    for msg in messages:
-        if "Error:" in msg["content"]:
-            continue
-        role = "user" if msg["role"] == "user" else "model"
-        gemini_history.append(types.Content(
-            role=role,
-            parts=[types.Part.from_text(text=msg["content"])]
-        ))
-    return gemini_history
-
-def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, file_path=None):
+def call_gemini(model, api_key, history_messages, prompt, sys_instruct, file_bytes=None, file_path=None, attach_file_now=False):
     if not api_key:
         return {"success": False, "error": "Gemini API key not configured"}
 
@@ -130,38 +121,62 @@ def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, file_pat
         http_options=types.HttpOptions(api_version="v1beta")
     )
 
-    # ⏱️ TIMER STARTED HERE (Includes the file upload delay on Turn 1)
     start_time = time.time() 
 
-    # 1. Attempt Context Caching (requires uploading to Google's File API)
-    cache_name = None
+    # 1. Attempt Context Caching ONLY when file is explicitly sent
     state_key = f"gemini_cache_{model}"
-    
-    if file_path:
-        if state_key in st.session_state and st.session_state[state_key]:
-            cache_name = st.session_state[state_key]
-        else:
-            try:
-                gemini_file = client.files.upload(file=file_path)
-                cache = client.caches.create(
-                    model=model,
-                    config=types.CreateCachedContentConfig(
-                        system_instruction=sys_instruct,
-                        contents=[
-                            types.Content(
-                                role="user", 
-                                parts=[types.Part.from_uri(file_uri=gemini_file.uri, mime_type="application/pdf")]
-                            )
-                        ],
-                        ttl="3600s"
-                    )
+    if attach_file_now and file_path:
+        try:
+            gemini_file = client.files.upload(file=file_path)
+            cache = client.caches.create(
+                model=model,
+                config=types.CreateCachedContentConfig(
+                    system_instruction=sys_instruct,
+                    contents=[
+                        types.Content(
+                            role="user", 
+                            parts=[types.Part.from_uri(file_uri=gemini_file.uri, mime_type="application/pdf")]
+                        )
+                    ],
+                    ttl="3600s"
                 )
-                cache_name = cache.name
-                st.session_state[state_key] = cache_name
-            except Exception as e:
-                st.session_state[state_key] = None 
+            )
+            st.session_state[state_key] = cache.name
+        except Exception as e:
+            if "PermissionDenied" in str(e) or "403" in str(e):
+                st.warning(f"⚠️ Gemini File API Permission Denied for {model}. Falling back to standard bytes payload.")
+            st.session_state[state_key] = None 
 
-    # 2. Configure Payload based on Cache Status
+    cache_name = st.session_state.get(state_key)
+    
+    # 🚨 FIX: Ignore leftover caches from hot-reloads if no file was ever attached in this specific chat history
+    has_historical_file = any(m.get("has_file", False) for m in history_messages)
+    if not attach_file_now and not has_historical_file:
+        cache_name = None
+
+    # 2. Build history dynamically based on which turns had the file
+    gemini_history = []
+    for msg in history_messages:
+        if "Error:" in msg["content"]:
+            continue
+        role = "user" if msg["role"] == "user" else "model"
+        parts = []
+        
+        # If cache is missing, embed file bytes into historical messages that had it
+        if not cache_name and msg.get("has_file") and file_bytes:
+            parts.append(types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
+            
+        parts.append(types.Part.from_text(text=msg["content"]))
+        gemini_history.append(types.Content(role=role, parts=parts))
+
+    # Add the current prompt
+    current_parts = []
+    if not cache_name and attach_file_now and file_bytes:
+        current_parts.append(types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
+    current_parts.append(types.Part.from_text(text=prompt))
+    gemini_history.append(types.Content(role="user", parts=current_parts))
+
+    # 3. Configure Payload
     if cache_name:
         config = types.GenerateContentConfig(
             cached_content=cache_name,
@@ -174,19 +189,16 @@ def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, file_pat
             temperature=0.7,
             safety_settings=[types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE")]
         )
-        if file_bytes and len(history) > 0 and len(history[0].parts) == 1: 
-            history[0].parts.append(types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
                 model=model,
-                contents=history,
+                contents=gemini_history,
                 config=config
             )
             
-            # ⏱️ TIMER STOPPED HERE
             end_time = time.time() 
 
             if response.text:
@@ -194,7 +206,6 @@ def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, file_pat
                 if usage:
                     total_prompt = getattr(usage, 'prompt_token_count', 0) or 0
                     cache_read = getattr(usage, 'cached_content_token_count', 0) or 0
-                    # ✅ FIX: Prevents negative tokens caused by Google's backend tokenization drift
                     uncached_input = max(0, total_prompt - cache_read)
                     output_tokens = getattr(usage, 'candidates_token_count', 0) or 0
                 else:
@@ -219,25 +230,22 @@ def call_gemini(model, api_key, history, sys_instruct, file_bytes=None, file_pat
             return {"success": False, "error": str(e)}
 
 # --- CLAUDE CLIENT ---
-def call_claude(model, client: anthropic.Anthropic, system_instruction, history_messages, prompt, file_bytes=None):
+def call_claude(model, client: anthropic.Anthropic, system_instruction, history_messages, prompt, file_bytes=None, attach_file_now=False):
     if client is None:
         return {"success": False, "error": "Anthropic client not configured"}
 
     messages = []
     
-    for i, m in enumerate(history_messages):
-        if i == 0 and file_bytes and m["role"] == "user":
+    # Rebuild history dynamically, inserting the file exactly where it was historically attached
+    for m in history_messages:
+        if m.get("has_file") and file_bytes:
             pdf_data = base64.b64encode(file_bytes).decode("utf-8")
             messages.append({
-                "role": "user",
+                "role": m["role"],
                 "content": [
                     {
                         "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_data
-                        },
+                        "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_data},
                         "cache_control": {"type": "ephemeral"} 
                     },
                     {"type": "text", "text": str(m["content"])}
@@ -247,15 +255,11 @@ def call_claude(model, client: anthropic.Anthropic, system_instruction, history_
             messages.append({"role": m["role"], "content": str(m["content"])})
 
     user_content = []
-    if file_bytes and len(history_messages) == 0:
+    if attach_file_now and file_bytes:
         pdf_data = base64.b64encode(file_bytes).decode("utf-8")
         user_content.append({
             "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": pdf_data
-            },
+            "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_data},
             "cache_control": {"type": "ephemeral"} 
         })
         
@@ -263,7 +267,7 @@ def call_claude(model, client: anthropic.Anthropic, system_instruction, history_
     messages.append({"role": "user", "content": user_content})
 
     try:
-        start_time = time.time() # ⏱️ Start Claude Timer
+        start_time = time.time()
         
         resp = client.messages.create(
             model=model,
@@ -273,7 +277,7 @@ def call_claude(model, client: anthropic.Anthropic, system_instruction, history_
             extra_headers={"anthropic-beta": "prompt-caching-2024-07-31,pdfs-2024-09-25"} 
         )
         
-        end_time = time.time() # ⏱️ Stop Claude Timer
+        end_time = time.time()
         
         content = resp.content[0].text
         input_tokens = resp.usage.input_tokens
@@ -327,39 +331,43 @@ with st.sidebar:
     st.divider()
     st.header("🧠 2. The 'Teacher' Persona")
 
-    default_prompt = """You are a mutual fund expert in India. Your task is to analyse the attached mutual fund factsheet and explain it to a novice investor who lives in India, ensuring the investor understands the scheme's features, feels confident, and makes informed decisions. Please respond concisely to the investor's queries using the following communication guidelines.
+    default_prompt = """# Mutual Fund Factsheet Companion
 
-Communication Guidelines
+## Role
 
-1. Simplify & Educate
-Use plain language and relatable real-world examples. Define technical terms immediately. 
+You are a financial literacy educator specializing in Indian mutual funds, embedded alongside a mutual fund factsheet to help investors understand what they're reading.
 
-2. Focus on Key Information First
-Prioritize fund's objective, performance and risk concepts and suitability, following SEBI's emphasis on disclosing fundamental attributes upfront.
+## Context
 
-3. Visual Risk Communication
-Use SEBI's color-coded risk-o-meter system to help investors visually understand risk levels (low to very high) rather than relying on complex numerical indicators.
+The investor is looking at a mutual fund factsheet and has access to you as a companion tool for asking questions about it. Your job is to clearly explain whatever they want to know, and to help them notice what's worth paying attention to.
 
-4. Explain Costs Transparently
-Clearly distinguish between expense ratios, exit loads, and differences between direct and regular plans, as mandated by SEBI's disclosure requirements.
+## Core Principles
 
-5. Put Performance in Context
-Present historical returns across multiple timeframes while emphasizing that past performance doesn't guarantee future results and comparing against appropriate benchmarks.
+1. **Answer what's asked.** Explain the concept the investor asks about, fully and clearly.
 
-6. Assess Suitability
-Connect fund features to the investor's financial goals, time horizon, and risk appetite rather than just presenting data, following AMFI's fiduciary standards.
+2. **Plain language with substance.** Use everyday language and real-world analogies to explain technical terms. Define jargon in one sentence the first time it comes up, then use it naturally.
 
-7. Disclose All Material Information
-Ensure completeness by covering portfolio holdings, fund manager details, asset allocation, and any recent changes as required by SEBI regulations.
+3. **One concept at a time.** Cover a maximum of 1–2 ideas per response, except for the initial menu. If the question touches on more, handle the core of it and mention that related concepts are available if they're interested.
 
-8. Encourage Questions
-Create an open environment where investors feel comfortable asking for clarification on any aspect they don't understand, supporting informed decision-making.
+4. **Short and conversational.** Keep responses to 2–4 sentences. Brevity is essential — the investor should be able to read your answer in a few seconds. Only go longer if the concept genuinely can't be explained in fewer words, and never exceed 5 sentences in a single response.
 
-Operational rules for every response:
-- Strict Scope: Stick to the factsheet. If information is missing/irrelevant, reply: "Out of scope for factsheet-based discussion" or "Not stated in the document." 
-- Proactive Education: Do not wait for questions. Proactively identify and explain critical concepts (e.g., Sharpe ratio, CAGR, Beta, Benchmark returns, Volatility, AUM, Taxation, etc.) to build a foundation. 
-- Brevity: Keep responses concise and action-oriented. Ex: 100-150 words per response.
-- Engagement: If the user doesn't continue the conversation after a brief pause, proactively ask follow-up questions on critical concepts."""
+5. **Put numbers in context.** When explaining any figure from the factsheet, briefly show what makes it high, low, or typical — against the benchmark, the category average, or a common reference point, if that information is available in the factsheet.
+
+6. **Be honest about limitations.** If a number could be misleading without context, say so simply. If the factsheet doesn't contain enough information to fully answer a question, say that too.
+
+## Strict Rules
+
+- Only discuss what's in the factsheet. If asked about something not covered, say: "That's not in this factsheet — you'd want to check [specific source] for that."
+
+- Never recommend buying, selling, or holding any fund. If asked, redirect: "I can help you understand what this fund does and what the numbers mean — but the decision depends on your personal situation, and a SEBI-registered advisor can help with that."
+
+## First Response
+
+When the investor shares the factsheet, briefly confirm the fund name and category, then offer a short menu of things you can explain — each described in a few words. Pick 4–6 items based on what's most noteworthy in this specific factsheet. End with something like: "Or just ask me anything else about the factsheet."
+
+## Subsequent Responses
+
+Answer what's asked, then end with a brief nudge toward something important the investor hasn't explored yet."""
 
     system_prompt = st.text_area("System Instructions", value=default_prompt, height=250)
 
@@ -399,7 +407,13 @@ Operational rules for every response:
                     st.session_state[k] = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
                 if k == "turn_count": st.session_state[k] = 0
         
+        st.session_state.factsheet_sent = False
         st.session_state.user_id = str(uuid.uuid4())
+        
+        # Clear specific caches on reset
+        if f"gemini_cache_{MODEL_A}" in st.session_state: st.session_state[f"gemini_cache_{MODEL_A}"] = None
+        if f"gemini_cache_{MODEL_B}" in st.session_state: st.session_state[f"gemini_cache_{MODEL_B}"] = None
+        
         st.rerun()
 
 # --- UI (THREE MODEL LAYOUT) ---
@@ -447,10 +461,23 @@ if "messages_b" in st.session_state and len(st.session_state.messages_b) > 0:
             st.divider()
 
 # --- INPUT LOGIC & ASYNC GENERATION ---
+prompt = None
+attach_file_now = False
+
 if st.session_state.turn_count < MAX_TURNS:
-    prompt = st.chat_input(f"Ask question ({st.session_state.turn_count + 1}/{MAX_TURNS})...")
+    if not st.session_state.get("factsheet_sent", False):
+        st.info("💡 The models don't have the factsheet yet. You can chat normally, or send it to them whenever you're ready.")
+        if st.button("📎 Send Factsheet & Start Analysis", type="primary"):
+            prompt = "Here is the factsheet."
+            attach_file_now = True
+            st.session_state.factsheet_sent = True
+
+    chat_prompt = st.chat_input(f"Ask question ({st.session_state.turn_count + 1}/{MAX_TURNS})...")
+    
+    if chat_prompt:
+        prompt = chat_prompt
+            
 else:
-    prompt = None
     st.warning("🛑 You have reached the 30-question limit for this session. Please Reset to start over.")
 
 if prompt:
@@ -458,14 +485,6 @@ if prompt:
 
     with st.chat_message("user"):
         st.markdown(prompt)
-
-    history_claude = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages_claude]
-
-    history_a_sdk = build_gemini_history(st.session_state.messages_a)
-    history_a_sdk.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
-
-    history_b_sdk = build_gemini_history(st.session_state.messages_b)
-    history_b_sdk.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
 
     # Setup the live UI placeholders
     c1, c2, c3 = st.columns(3)
@@ -482,12 +501,12 @@ if prompt:
         placeholder_claude = st.empty()
         placeholder_claude.info("⏳ Generating response...")
 
-    # Define the state updater
-    def update_state(result, msgs_key, tokens_key):
+    # Define the state updater (Now stores whether this turn included the file)
+    def update_state(result, msgs_key, tokens_key, sent_file):
         if result is None:
             return "(model unavailable)"
         
-        st.session_state[msgs_key].append({'role': 'user', 'content': prompt})
+        st.session_state[msgs_key].append({'role': 'user', 'content': prompt, 'has_file': sent_file})
         
         if result.get("success"):
             content = result["content"]
@@ -516,27 +535,25 @@ if prompt:
         future_to_model = {}
         
         if GEMINI_API_KEY:
-            # We now pass `uploaded_file` path to Gemini for Caching
-            f_a = executor.submit(call_gemini, MODEL_A, GEMINI_API_KEY, history_a_sdk, system_prompt, fact_sheet_bytes, uploaded_file)
+            f_a = executor.submit(call_gemini, MODEL_A, GEMINI_API_KEY, st.session_state.messages_a, prompt, system_prompt, fact_sheet_bytes, uploaded_file, attach_file_now)
             future_to_model[f_a] = ("a", placeholder_a, "messages_a", "tokens_a")
 
-            f_b = executor.submit(call_gemini, MODEL_B, GEMINI_API_KEY, history_b_sdk, system_prompt, fact_sheet_bytes, uploaded_file)
+            f_b = executor.submit(call_gemini, MODEL_B, GEMINI_API_KEY, st.session_state.messages_b, prompt, system_prompt, fact_sheet_bytes, uploaded_file, attach_file_now)
             future_to_model[f_b] = ("b", placeholder_b, "messages_b", "tokens_b")
 
-        f_claude = executor.submit(call_claude, MODEL_CLAUDE, anthropic_client, system_prompt, history_claude, prompt, fact_sheet_bytes)
+        f_claude = executor.submit(call_claude, MODEL_CLAUDE, anthropic_client, system_prompt, st.session_state.messages_claude, prompt, fact_sheet_bytes, attach_file_now)
         future_to_model[f_claude] = ("claude", placeholder_claude, "messages_claude", "tokens_claude")
 
-        # As each model finishes, update its specific column immediately
         for future in concurrent.futures.as_completed(future_to_model):
             model_key, ph, msgs_key, tokens_key = future_to_model[future]
             
             try:
                 res = future.result()
-                txt = update_state(res, msgs_key, tokens_key)
+                txt = update_state(res, msgs_key, tokens_key, attach_file_now)
                 results_dict[model_key] = txt
                 
-                ph.empty() # Clear the "⏳ Generating..." box
-                with ph.container(): # Display the final answer natively
+                ph.empty() 
+                with ph.container(): 
                     with st.chat_message("assistant"):
                         if res and res.get("success"):
                             if "time" in res:
@@ -548,10 +565,8 @@ if prompt:
                 ph.error(f"Execution failed: {e}")
                 results_dict[model_key] = str(e)
 
-    # Log to Google Sheets after all have completed
     log_to_google_sheet(prompt, results_dict.get("a", ""), results_dict.get("b", ""), results_dict.get("claude", ""))
     
-    # Rerun to finalize state and refresh sidebar billing
     st.rerun()
 
 # --- BOTTOM: COST SUMMARY ---
